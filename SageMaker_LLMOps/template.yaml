@@ -1,0 +1,476 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: "Template to create CloudTrail and EventBridge resources for S3 event monitoring"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to monitor
+    Default: ""
+  PipelineName:
+    Type: String
+    Description: Name of the SageMaker Pipeline to trigger
+    Default: ""
+  ModelPackageGroupName:
+    Type: String
+    Description: Name of the SageMaker Model Package Group
+  SendApprovalEmailImageUri:
+    Type: String
+    Description: URI of the Docker image for the SendApprovalEmailFunction
+  SenderEmailId:
+    Type: String
+    Description: Please enter the Email from which email will be sent
+  RecipientEmailId:
+    Type: String
+    Description: Please enter the Email to send notification to
+
+Resources:
+  SageMakerPipelineBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref S3BucketName
+  ##########################################################################
+  #  Lambda Function Role
+  ##########################################################################
+  InvokeSagemakerPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerPipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:StartPipelineExecution
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/*"
+
+  ##########################################################################
+  # Lambda Function to Process Arrow Files
+  ##########################################################################
+  InvokeSagemakerPipelineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt InvokeSagemakerPipelineRole.Arn
+      Environment:
+        Variables:
+          PIPELINE_NAME: !Ref PipelineName
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          def handler(event, context):
+              sm_client = boto3.client('sagemaker')
+              try:
+                  response = sm_client.start_pipeline_execution(
+                      PipelineName=os.environ['PIPELINE_NAME']
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Pipeline execution started')
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  ##########################################################################
+  # Notification Configuration Function Role
+  ##########################################################################
+  ApplyNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowBucketNotification
+                Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+
+  ##########################################################################
+  # Notification Configuration Function
+  ##########################################################################
+  ApplyBucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt ApplyNotificationFunctionRole.Arn
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import json
+          import cfnresponse
+
+          s3Client = boto3.client('s3')
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          def addBucketNotification(bucketName, notificationId, functionArn):
+            notificationResponse = s3Client.put_bucket_notification_configuration(
+              Bucket=bucketName,
+              NotificationConfiguration={
+                'LambdaFunctionConfigurations': [
+                  {
+                    'Id': notificationId,
+                    'LambdaFunctionArn': functionArn,
+                    'Events': ['s3:ObjectCreated:*'],
+                    'Filter': {
+                      'Key': {
+                        'FilterRules': [
+                          {
+                            'Name': 'suffix',
+                            'Value': '.arrow'
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            )
+            return notificationResponse
+
+          def create(properties, physical_id):
+            bucketName = properties['S3Bucket']
+            notificationId = properties['NotificationId']
+            functionArn = properties['FunctionARN']
+            response = addBucketNotification(bucketName, notificationId, functionArn)
+            logger.info('AddBucketNotification response: %s' % json.dumps(response))
+            return cfnresponse.SUCCESS, physical_id
+
+          def update(properties, physical_id):
+            return create(properties, physical_id)
+
+          def delete(properties, physical_id):
+            return cfnresponse.SUCCESS, None
+
+          def handler(event, context):
+            logger.info('Received event: %s' % json.dumps(event))
+            status = cfnresponse.FAILED
+            new_physical_id = None
+
+            try:
+              properties = event.get('ResourceProperties')
+              physical_id = event.get('PhysicalResourceId')
+
+              status, new_physical_id = {
+                'Create': create,
+                'Update': update,
+                'Delete': delete
+              }.get(event['RequestType'], lambda x, y: (cfnresponse.FAILED, None))(properties, physical_id)
+            except Exception as e:
+              logger.error('Exception: %s' % e)
+              status = cfnresponse.FAILED
+            finally:
+              cfnresponse.send(event, context, status, {}, new_physical_id)
+
+  # Lambda Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref InvokeSagemakerPipelineFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt SageMakerPipelineBucket.Arn
+      SourceAccount: !Ref "AWS::AccountId"
+
+  # Apply Notification Custom Resource
+  ApplyNotification:
+    Type: Custom::ApplyNotification
+    Properties:
+      ServiceToken: !GetAtt ApplyBucketNotificationFunction.Arn
+      S3Bucket: !Ref S3BucketName
+      FunctionARN: !GetAtt InvokeSagemakerPipelineFunction.Arn
+      NotificationId: TrainingDataFileCreatedEvent
+
+  ##########################################################################
+  # EventBridge Rule to monitor SageMaker Model Package state changes
+  ##########################################################################
+  ModelPackageStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to monitor SageMaker Model Package state changes to PendingManualApproval"
+      EventPattern:
+        source:
+          - aws.sagemaker
+        detail-type:
+          - "SageMaker Model Package State Change"
+        detail:
+          ModelPackageGroupName:
+            - !Ref ModelPackageGroupName
+          ModelApprovalStatus:
+            - PendingManualApproval
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SendApprovalEmailFunction.Arn
+          Id: "ModelApprovalEmailTarget"
+  ##########################################################################
+  #  Lambda Functions                                                       #
+  ##########################################################################
+  ModelApproveFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt ModelActionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              # Get model package ARN from query parameters
+              model_package_arn = event['queryStringParameters']['arn']
+              model_package_version = event['queryStringParameters']['version']
+              # Update model package approval status
+              sagemaker = boto3.client('sagemaker')
+              response = sagemaker.update_model_package(
+                  ModelPackageArn=model_package_arn,
+                  ModelApprovalStatus='Approved'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'text/html'
+                  },
+                  'body': '<h1>Model Approved Successfully</h1>'
+              }
+
+  ModelRejectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt ModelActionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              # Get model package ARN from query parameters
+              model_package_arn = event['queryStringParameters']['arn']
+              model_package_version = event['queryStringParameters']['version']
+              # Update model package approval status
+              sagemaker = boto3.client('sagemaker')
+              response = sagemaker.update_model_package(
+                  ModelPackageArn=model_package_arn,
+                  ModelApprovalStatus='Rejected'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'text/html'
+                  },
+                  'body': '<h1>Model Rejected Successfully</h1>'
+              }
+
+  ModelActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:UpdateModelPackage
+                  - sagemaker:DescribeModelPackage
+                  - sagemaker:ListModelPackages
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*"
+
+  SendApprovalEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      ImageUri: !Ref SendApprovalEmailImageUri
+      Role: !GetAtt LambdaExecutionRole.Arn
+      CodeUri: ./src/notify-model-approval
+      PackageType: Image
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmailId
+          RECIPIENT_EMAIL: !Ref RecipientEmailId
+          API_GATEWAY_URL: !Sub "https://${SagemakerApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          TRANSFORMERS_CACHE: /tmp/
+          MPLCONFIGDIR: /tmp/
+      Architectures:
+        - arm64
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: loggroups
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ses:SendEmail"
+                  - "ses:SendRawEmail"
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+
+  ##########################################################################
+  #  API Gateway                                                           #
+  ##########################################################################
+  SagemakerApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "SagemakerModelApprovalAPI"
+      Description: "API to update Sagemaker model status in Model Registry"
+
+  ApproveResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SagemakerApiGateway
+      ParentId: !GetAtt SagemakerApiGateway.RootResourceId
+      PathPart: approve
+
+  RejectResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SagemakerApiGateway
+      ParentId: !GetAtt SagemakerApiGateway.RootResourceId
+      PathPart: reject
+
+  ApproveMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SagemakerApiGateway
+      ResourceId: !Ref ApproveResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt ModelApproveFunction.Arn
+
+  RejectMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SagemakerApiGateway
+      ResourceId: !Ref RejectResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt ModelRejectFunction.Arn
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApproveMethod
+      - RejectMethod
+    Properties:
+      RestApiId: !Ref SagemakerApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref SagemakerApiGateway
+      StageName: prod
+
+  ##########################################################################
+  #  Lambda Permissions                                                      #
+  ##########################################################################
+  SendApprovalEmailPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendApprovalEmailFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelPackageStateChangeRule.Arn
+  ApprovePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ModelApproveFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SagemakerApiGateway}/*
+
+  RejectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ModelRejectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SagemakerApiGateway}/*

@@ -1,0 +1,712 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: A Step Functions Standard Workflow that customizes a foundation model in Amazon Bedrock
+
+Parameters:
+  SenderEmailId:
+    Type: String
+    Description: Please enter the Email from which email will be sent
+
+  RecipientEmailId:
+    Type: String
+    Description: Please enter the Email to send notification to
+
+  ContainerImageURI:
+    Type: String
+    Description: Docker image URI for the AWS Lambda function
+  InvokeModelContainerImageURI:
+    Type: String
+    Description: Docker image URI for the InvokeModelCustomiser AWS Lambda function
+
+Resources:
+  ##########################################################################
+  #   Step Functions                                                        #
+  ##########################################################################
+  StateMachineCustomizeBedrockModel:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      DefinitionUri: statemachine/bedrock-model-customization.asl.json
+      DefinitionSubstitutions:
+        TrainingDataBucket: !Sub "s3://${TrainingDataBucket}"
+        CustomizationOutputBucket: !Sub "s3://${CustomizationOutputBucket}"
+        ValidationDataBucket: !Ref ValidationDataBucket
+        ModelInferenceBucket: !Ref ModelInferenceBucket
+        BedrockModelCustomizationServiceRoleArn: !GetAtt BedrockModelCustomizationServiceRole.Arn
+        StateMachineEvaluateCustomBedrockModelArn: !GetAtt StateMachineEvaluateCustomBedrockModel.Arn
+      Role:
+        Fn::GetAtt: [StatesExecutionRole, Arn]
+      Type: STANDARD
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: false
+        Level: "ALL"
+  StateMachineEvaluateCustomBedrockModel:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      DefinitionUri: statemachine/evaluate-custom-model.asl.json
+      DefinitionSubstitutions:
+        ValidationDataBucket: !Ref ValidationDataBucket
+        ModelInferenceBucket: !Ref ModelInferenceBucket
+        BedrockModelCustomizationServiceRoleArn: !GetAtt BedrockModelCustomizationServiceRole.Arn
+        ModelEvaluationFunction: !GetAtt ModelEvaluationFunction.Arn
+      Role:
+        Fn::GetAtt: [StatesExecutionRole, Arn]
+      Type: STANDARD
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: false
+        Level: "ALL"
+  ##########################################################################
+  #  Step Functions Log Group                                             #
+  ##########################################################################
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        !Join ["/", ["/aws/vendedlogs/states", CustomizeBedrockModel]]
+
+  ##########################################################################
+  #   Roles                                                               #
+  ##########################################################################
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: CWLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogDelivery"
+                  - "logs:CreateLogStream"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutLogEvents"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateModelCustomizationJob
+                  - bedrock:GetModelCustomizationJob
+                  - bedrock:CreateProvisionedModelThroughput
+                  - bedrock:InvokeModel
+                  - bedrock:DeleteProvisionedModelThroughput
+                  - bedrock:DeleteCustomModel
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}::*
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:custom-model/*
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-customization-job/*
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:provisioned-model-throughput/*
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:provisioned-model/*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt BedrockModelCustomizationServiceRole.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !Ref TrainingDataBucket
+                      - /*
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !Ref CustomizationOutputBucket
+                      - /*
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !Ref ValidationDataBucket
+                      - /*
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !Ref ModelInferenceBucket
+                      - /*
+        - PolicyName: StepFunctionStartExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource:
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+        - PolicyName: EventRulePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource:
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*
+  BedrockModelCustomizationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Sub ${AWS::AccountId}
+              ArnEquals:
+                "aws:SourceArn": !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-customization-job/*
+      # Path: "/"
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub ${TrainingDataBucket.Arn}/*
+                  - !Sub ${TrainingDataBucket.Arn}
+                  - !Sub ${CustomizationOutputBucket.Arn}/*
+                  - !Sub ${CustomizationOutputBucket.Arn}
+                Condition:
+                  StringEquals:
+                    "aws:PrincipalAccount": !Sub ${AWS::AccountId}
+
+  ##########################################################################
+  # Invoke Model Customiser Step Functions AWS Lambda function
+  ##########################################################################
+  InvokeModelLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !GetAtt StateMachineCustomizeBedrockModel.Arn
+
+  InvokeModelCustomiserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      ImageUri: !Ref InvokeModelContainerImageURI
+      Role: !GetAtt InvokeModelLambdaExecutionRole.Arn
+      PackageType: Image
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Environment:
+        Variables:
+          TRANSFORMERS_CACHE: /tmp/
+          MPLCONFIGDIR: /tmp/
+          STEPFUNCTION_ARN: !GetAtt StateMachineCustomizeBedrockModel.Arn
+      Architectures:
+        - x86_64
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InvokeModelCustomiserFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !GetAtt TrainingDataBucket.Arn
+      SourceAccount: !Ref "AWS::AccountId"
+  ##########################################################################
+  #  Training Data S3 Bucket                                                              #
+  ##########################################################################
+  TrainingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-training-data
+  ##########################################################################
+  #  Training Data S3 Bucket Notification                                                             #
+  ##########################################################################
+
+  ApplyNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowBucketNotification
+                Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource:
+                  - !Sub "arn:aws:s3:::${TrainingDataBucket}"
+                  - !Sub "arn:aws:s3:::${TrainingDataBucket}/*"
+
+  ApplyBucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Dummy function, just logs the received event
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt "ApplyNotificationFunctionRole.Arn"
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import json
+          import cfnresponse
+
+          s3Client = boto3.client('s3')
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          def addBucketNotification(bucketName, notificationId, functionArn):
+            notificationResponse = s3Client.put_bucket_notification_configuration(
+              Bucket=bucketName,
+              NotificationConfiguration={
+                'LambdaFunctionConfigurations': [
+                  {
+                    'Id': notificationId,
+                    'LambdaFunctionArn': functionArn,
+                    'Events': [
+                      's3:ObjectCreated:*'
+                    ]
+                  },
+                ]
+              }
+            )
+            return notificationResponse
+
+          def create(properties, physical_id):
+            bucketName = properties['S3Bucket']
+            notificationId = properties['NotificationId']
+            functionArn = properties['FunctionARN']
+            response = addBucketNotification(bucketName, notificationId, functionArn)
+            logger.info('AddBucketNotification response: %s' % json.dumps(response))
+            return cfnresponse.SUCCESS, physical_id
+
+          def update(properties, physical_id):
+            return cfnresponse.SUCCESS, None
+
+          def delete(properties, physical_id):
+            return cfnresponse.SUCCESS, None
+
+          def handler(event, context):
+            logger.info('Received event: %s' % json.dumps(event))
+
+            status = cfnresponse.FAILED
+            new_physical_id = None
+
+            try:
+              properties = event.get('ResourceProperties')
+              physical_id = event.get('PhysicalResourceId')
+
+              status, new_physical_id = {
+                'Create': create,
+                'Update': update,
+                'Delete': delete
+              }.get(event['RequestType'], lambda x, y: (cfnresponse.FAILED, None))(properties, physical_id)
+            except Exception as e:
+              logger.error('Exception: %s' % e)
+              status = cfnresponse.FAILED
+            finally:
+              cfnresponse.send(event, context, status, {}, new_physical_id)
+
+  ApplyNotification:
+    Type: Custom::ApplyNotification
+    Properties:
+      ServiceToken: !GetAtt "ApplyBucketNotificationFunction.Arn"
+      S3Bucket: !Ref "TrainingDataBucket"
+      FunctionARN: !GetAtt "InvokeModelCustomiserFunction.Arn"
+      NotificationId: S3ObjectCreatedEvent
+  ##########################################################################
+  #  Training Output S3 Bucket                                                              #
+  ##########################################################################
+  CustomizationOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-customization-output
+
+  ##########################################################################
+  #  Custom Model validation data S3 Bucket                                                              #
+  ##########################################################################
+  ValidationDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-validation-data
+
+  ##########################################################################
+  #  Custom Model Inference Inference S3 Bucket                                                              #
+  ##########################################################################
+  ModelInferenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-inference
+
+  ##########################################################################
+  # Create SES Email Identity
+  ##########################################################################
+  SESEmailSender:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SenderEmailId
+
+  ##########################################################################
+  # Create custom model evaluator AWS Lambda function
+  ##########################################################################
+
+  ModelEvaluationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      ImageUri: !Ref ContainerImageURI
+      Role: !GetAtt LambdaExecutionRole.Arn
+      CodeUri: ./evaluation_lambda
+      PackageType: Image
+      Timeout: 900
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Environment:
+        Variables:
+          REFERENCE_INFERENCE: reference-inference.json
+          BASE_MODEL_INFERENCE: base-model-inference.json
+          CUSTOM_MODEL_INFERENCE: custom-model-inference.json
+          S3_BUCKET_INFERENCE: !Sub ${AWS::StackName}-${AWS::AccountId}-inference
+          S3_BUCKET_VALIDATION: !Sub ${AWS::StackName}-${AWS::AccountId}-validation-data
+          API_GATEWAY_URL: !Sub "https://${BedrockApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          TRANSFORMERS_CACHE: /tmp/
+          MPLCONFIGDIR: /tmp/
+          SENDER_EMAIL: !Ref SenderEmailId
+          RECIPIENT_EMAIL: !Ref RecipientEmailId
+      Architectures:
+        - arm64
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub ${ValidationDataBucket.Arn}/*
+                  - !Sub ${ValidationDataBucket.Arn}
+                  - !Sub ${ModelInferenceBucket.Arn}/*
+                  - !Sub ${ModelInferenceBucket.Arn}
+                Condition:
+                  StringEquals:
+                    "aws:PrincipalAccount": !Sub ${AWS::AccountId}
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ses:SendEmail"
+                  - "ses:SendRawEmail"
+                Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+
+  ##########################################################################
+  # API Gateway and Lambda for Model Approval
+  ##########################################################################
+
+  BedrockModelUpdaterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "BedrockModelUpdater"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt BedrockModelUpdaterLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib.parse
+
+          bedrock = boto3.client('bedrock')
+          ssm = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              try:
+                  print("Received event:", json.dumps(event, indent=2))
+                  
+                  # Extract model ARN from different possible locations
+                  model_arn = None
+                  
+                  # Try path parameters
+                  if 'pathParameters' in event and event['pathParameters']:
+                      model_arn = event['pathParameters'].get('modelArn')
+                  if not model_arn and event.get('path'):
+                      path_parts = event['path'].split('/')
+                      if len(path_parts) > 2:
+                          model_arn = urllib.parse.unquote(path_parts[-1])
+                  if not model_arn:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Model ARN not provided',
+                              'event': event
+                          })
+                      }
+
+                  print(f"Updating parameter store with model ARN: {model_arn}")
+                  
+                  # Update the ARN in Parameter Store
+                  ssm.put_parameter(
+                      Name="CustomModelId",
+                      Value=model_arn,
+                      Type="String",
+                      Overwrite=True
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'text/html',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': f'''
+                      <html>
+                          <body>
+                              <h1>Success!</h1>
+                              <p>Model ARN updated successfully: {model_arn}</p>
+                          </body>
+                      </html>
+                      '''
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'event': event
+                      })
+                  }
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+
+  BedrockModelUpdaterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "BedrockAndSSMPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "bedrock:CreateProvisionedModelThroughput"
+                  - "bedrock:DescribeModel"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "ssm:PutParameter"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  BedrockApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "BedrockModelUpdaterApi"
+      Description: "API to update Bedrock model ARN in Parameter Store"
+
+  BedrockApiResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt BedrockApiGateway.RootResourceId
+      PathPart: "updateModelArn"
+      RestApiId: !Ref BedrockApiGateway
+
+  BedrockApiModelArnResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !Ref BedrockApiResource
+      PathPart: "{modelArn}"
+      RestApiId: !Ref BedrockApiGateway
+
+  BedrockApiModelArnMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref BedrockApiGateway
+      ResourceId: !Ref BedrockApiModelArnResource
+      HttpMethod: "GET"
+      AuthorizationType: "NONE"
+      Integration:
+        Type: "AWS_PROXY"
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockModelUpdaterLambda.Arn}/invocations"
+        PassthroughBehavior: "WHEN_NO_MATCH"
+      RequestParameters:
+        method.request.path.modelArn: true
+      RequestModels: {}
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseModels:
+            "application/json": "Empty"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Origin": true
+
+  ApiGatewayInvokeLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref BedrockModelUpdaterLambda
+      Principal: "apigateway.amazonaws.com"
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - BedrockApiModelArnMethod
+    Properties:
+      RestApiId: !Ref BedrockApiGateway
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref BedrockApiGateway
+      StageName: "prod"
+
+##########################################################################
+#   Outputs                                                              #
+##########################################################################
+Outputs:
+  StateMachineCustomizeBedrockModelArn:
+    Value: !Ref StateMachineCustomizeBedrockModel
+    Description: StateMachineCustomizeBedrockModel Arn
+
+  BedrockModelCustomizationServiceRoleArn:
+    Description: Service Role for the Bedrock Model Customization
+    Value: !GetAtt BedrockModelCustomizationServiceRole.Arn
+
+  TrainingDataBucket:
+    Description: S3 Bucket for storing Bedrock model customization training data
+    Value: !Ref TrainingDataBucket
+
+  CustomizationOutputBucket:
+    Description: S3 Bucket for storing Bedrock model customization training data
+    Value: !Ref CustomizationOutputBucket
+
+  ValidationDataBucket:
+    Description: S3 Bucket for storing Bedrock custom model validation data
+    Value: !Ref ValidationDataBucket
+
+  ModelInferenceBucket:
+    Description: S3 Bucket for storing inference
+    Value: !Ref ModelInferenceBucket
