@@ -113,7 +113,7 @@ def generate_email_body(model_package_group_name, approve_url, reject_url):
             <strong>Model Package Group:</strong> {model_package_group_name}
         </div>
 
-        <p>Sincerely,<br>The Amazon Web Services Team</p>
+        <p>Sincerely,<br>The LLMOps Team</p>
 
         <div class="button-container">
             <a href="{approve_url}" class="button approve">Approve Custom Model</a>
